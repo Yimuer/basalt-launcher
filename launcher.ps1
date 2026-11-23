@@ -566,6 +566,16 @@ public static class BasaltLauncherNative {
     public static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
     [DllImport("user32.dll")]
     public static extern bool SetForegroundWindow(IntPtr hWnd);
+    [DllImport("user32.dll")]
+    public static extern int GetSystemMetrics(int nIndex);
+    [DllImport("user32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    public static extern IntPtr LoadImage(IntPtr hInst, string name, uint type, int cx, int cy, uint fuLoad);
+    [DllImport("user32.dll")]
+    public static extern IntPtr SendMessage(IntPtr hWnd, uint msg, IntPtr wParam, IntPtr lParam);
+    [DllImport("user32.dll")]
+    public static extern bool DestroyIcon(IntPtr hIcon);
+    [DllImport("shell32.dll")]
+    public static extern int SetCurrentProcessExplicitAppUserModelID(string appID);
 }
 '@ -ErrorAction SilentlyContinue
 try { [void][BasaltLauncherNative]::SetProcessDpiAwarenessContext([IntPtr](-4)) } catch {
@@ -582,6 +592,9 @@ if ($StateOnly) {
     } | ConvertTo-Json -Compress
     return
 }
+
+# 给启动器独立的任务栏身份，避免与 PowerShell 或旧窗口图标混在同一组。
+try { [void][BasaltLauncherNative]::SetCurrentProcessExplicitAppUserModelID('Yimuer.Basalt.Launcher') } catch { }
 
 $script:Mutex = $null
 try {
@@ -1017,19 +1030,45 @@ $res['OnAccentBrush']      = [System.Windows.Media.SolidColorBrush]::new($script
 $script:AccentBrush = $res['AccentBrush']
 $ui.TxtSubtitle.Text = "Basalt 引擎 · 模型 $($script:ModelName) · OpenAI 兼容接口"
 
-# 图标
+# 图标：WPF 直接解码 ICO 会默认选 16×16，再把它居中塞进任务栏的大图标里。
+# 因此 ImageSource 使用高分辨率 PNG；窗口小/大 HICON 在 Loaded 后按系统尺寸从 ICO 加载。
+$script:IconPath = Join-Path $script:LauncherDir 'launcher.ico'
+$script:BigIconHandle = [IntPtr]::Zero
+$script:SmallIconHandle = [IntPtr]::Zero
 try {
-    $iconPath = Join-Path $script:LauncherDir 'launcher.ico'
-    if (Test-Path -LiteralPath $iconPath) {
+    $iconPngPath = Join-Path $script:LauncherDir 'launcher.png'
+    $iconSourcePath = if (Test-Path -LiteralPath $iconPngPath) { $iconPngPath } else { $script:IconPath }
+    if (Test-Path -LiteralPath $iconSourcePath) {
         $bmp = New-Object System.Windows.Media.Imaging.BitmapImage
         $bmp.BeginInit()
         $bmp.CacheOption = [System.Windows.Media.Imaging.BitmapCacheOption]::OnLoad
-        $bmp.UriSource = New-Object System.Uri($iconPath)
+        $bmp.DecodePixelWidth = 256
+        $bmp.UriSource = New-Object System.Uri($iconSourcePath)
         $bmp.EndInit()
+        $bmp.Freeze()
         $script:Window.Icon = $bmp
         $ui.HeaderIcon.Source = $bmp
     }
 } catch { Write-Log "icon load failed: $($_.Exception.Message)" }
+
+function Set-NativeWindowIcons {
+    try {
+        $hwnd = (New-Object System.Windows.Interop.WindowInteropHelper($script:Window)).Handle
+        if ($hwnd -eq [IntPtr]::Zero -or -not (Test-Path -LiteralPath $script:IconPath)) { return }
+        $bigSize = [BasaltLauncherNative]::GetSystemMetrics(11)       # SM_CXICON
+        $smallSize = [BasaltLauncherNative]::GetSystemMetrics(49)     # SM_CXSMICON
+        $script:BigIconHandle = [BasaltLauncherNative]::LoadImage(
+            [IntPtr]::Zero, $script:IconPath, 1, $bigSize, $bigSize, 0x10)
+        $script:SmallIconHandle = [BasaltLauncherNative]::LoadImage(
+            [IntPtr]::Zero, $script:IconPath, 1, $smallSize, $smallSize, 0x10)
+        if ($script:BigIconHandle -ne [IntPtr]::Zero) {
+            [void][BasaltLauncherNative]::SendMessage($hwnd, 0x80, [IntPtr]1, $script:BigIconHandle)
+        }
+        if ($script:SmallIconHandle -ne [IntPtr]::Zero) {
+            [void][BasaltLauncherNative]::SendMessage($hwnd, 0x80, [IntPtr]::Zero, $script:SmallIconHandle)
+        }
+    } catch { Write-Log "native icon update failed: $($_.Exception.Message)" }
+}
 
 # Fluent ToolTip（弹出层不在 Window 资源树里，逐个塞样式）
 function Set-ToolTipStyle {
@@ -1113,6 +1152,7 @@ $script:Window.Add_Loaded({
         $script:Window.Topmost = $false
         $script:Window.Activate() | Out-Null
     } catch { }
+    Set-NativeWindowIcons
     try { Update-Ui } catch { Write-Log "initial ui failed: $($_.Exception.Message)" }
     $script:Timer.Start()
 })
@@ -1120,6 +1160,12 @@ $script:Window.Add_Loaded({
 $script:Window.Add_Closed({
     $script:Timer.Stop()
     try { $script:SpinStory.Stop($script:Window) } catch { }
+    if ($script:BigIconHandle -ne [IntPtr]::Zero) {
+        [void][BasaltLauncherNative]::DestroyIcon($script:BigIconHandle)
+    }
+    if ($script:SmallIconHandle -ne [IntPtr]::Zero) {
+        [void][BasaltLauncherNative]::DestroyIcon($script:SmallIconHandle)
+    }
     try { $script:Mutex.ReleaseMutex() } catch { }
 })
 
