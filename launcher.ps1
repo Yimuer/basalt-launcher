@@ -16,13 +16,18 @@
     由 launch.vbs 以隐藏控制台方式调起；快捷方式见 install-shortcuts.ps1。
 
     参数：
-      -Root <path>   指定项目根目录（默认：本脚本上一级目录），便于用假服务做端到端测试
-      -StateOnly     只打印一次状态 JSON 后退出（调试用）
+      -Root <path>        指定项目根目录（默认：本脚本上一级目录），便于用假服务做端到端测试
+      -StateOnly          只打印一次状态 JSON 后退出（调试用）
+      -StartInTray        启动即收进系统托盘：窗口一帧都不露面（开机自启用，见 launch.vbs）
 #>
 param(
     [string]$Root = '',
-    [switch]$StateOnly
+    [switch]$StateOnly,
+    [switch]$StartInTray
 )
+
+# -StartInTray 只影响这一次启动；收进托盘后，✕ / 托盘菜单回到常规行为
+$script:StartInTray = [bool]$StartInTray
 
 $ErrorActionPreference = 'Stop'
 
@@ -56,7 +61,8 @@ $script:StartCmd  = Join-Path $script:Root 'start.cmd'
 $script:StopCmd   = Join-Path $script:Root 'stop.cmd'
 $script:ConfigCmd = Join-Path $script:Root 'bin\config.cmd'
 $script:RunKey    = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run'
-$script:RunValue  = 'BasaltLocalAI'
+$script:RunValue  = 'BasaltLocalAI'            # 服务（引擎）自启：bin\boot.vbs -> start.cmd silent
+$script:LauncherRunValue = 'BasaltLauncher'    # 启动器自身自启：launcher\launch.vbs -StartInTray
 
 # ------------------------------------------------------------------ 解析配置 --
 function Read-BasaltConfig {
@@ -127,6 +133,10 @@ $script:AppDataDir      = Join-Path $env:LOCALAPPDATA 'BasaltLauncher'
 $script:SettingsFile    = Join-Path $script:AppDataDir 'settings.json'
 $script:ShowRequestFile = Join-Path $script:AppDataDir 'show.request'
 $script:CloseToTray     = $true      # 点 ✕ 收进系统托盘；false = 直接退出启动器
+$script:StartTrayHintShown = $false  # 登录自启那句「已在托盘」提示弹过没有（存 settings.json）
+$script:ThemeChoice     = 'system'   # 界面主题：dark | light | system（跟随系统）
+$script:MaterialChoice  = 'opaque'   # 背景材质：opaque | translucent | wallpaper
+$script:ThemeApplied    = 'dark'     # 真正生效的那套（选 system 时由注册表决定）
 
 function Read-LauncherSettings {
     try {
@@ -134,6 +144,17 @@ function Read-LauncherSettings {
         $o = [System.IO.File]::ReadAllText($script:SettingsFile) | ConvertFrom-Json
         if ($o -and ($o.PSObject.Properties.Name -contains 'closeToTray')) {
             $script:CloseToTray = [bool]$o.closeToTray
+        }
+        if ($o -and ($o.PSObject.Properties.Name -contains 'startTrayHintShown')) {
+            $script:StartTrayHintShown = [bool]$o.startTrayHintShown
+        }
+        if ($o -and ($o.PSObject.Properties.Name -contains 'theme')) {
+            $v = [string]$o.theme
+            if (@('dark', 'light', 'system') -contains $v) { $script:ThemeChoice = $v }
+        }
+        if ($o -and ($o.PSObject.Properties.Name -contains 'material')) {
+            $v = [string]$o.material
+            if (@('opaque', 'translucent', 'wallpaper') -contains $v) { $script:MaterialChoice = $v }
         }
     } catch { Write-Log "settings read failed: $($_.Exception.Message)" }
 }
@@ -143,22 +164,335 @@ function Save-LauncherSettings {
         if (-not (Test-Path -LiteralPath $script:AppDataDir)) {
             [void][System.IO.Directory]::CreateDirectory($script:AppDataDir)
         }
-        (@{ closeToTray = [bool]$script:CloseToTray } | ConvertTo-Json -Compress) |
+        (@{ closeToTray = [bool]$script:CloseToTray;
+            startTrayHintShown = [bool]$script:StartTrayHintShown;
+            theme = [string]$script:ThemeChoice;
+            material = [string]$script:MaterialChoice } | ConvertTo-Json -Compress) |
             Set-Content -LiteralPath $script:SettingsFile -Encoding UTF8
     } catch { Write-Log "settings write failed: $($_.Exception.Message)" }
 }
 
 Read-LauncherSettings
 
-# ---------------------------------------------------------------- 画刷缓存 --
+# ------------------------------------------------------ 主题 / 材质 / 画刷 --
+# 全套颜色只在这两张表里：XAML 一律 {DynamicResource XxxBrush}，切主题 = 换资源字典
+# 里的刷子（DynamicResource 会自己刷新），不用重建窗口。
+# 这段比文件后面的 Add-Type 早，先把 WPF 程序集叫出来（调色板要用 Media.Color）
+Add-Type -AssemblyName PresentationFramework
+Add-Type -AssemblyName PresentationCore
+Add-Type -AssemblyName WindowsBase
+$script:WhiteColor = [System.Windows.Media.Color]::FromArgb(255, 255, 255, 255)
+$script:BlackColor = [System.Windows.Media.Color]::FromArgb(255, 0, 0, 0)
+$script:ThemePalettes = @{
+    dark = @{
+        TextPrimary = '#FFFFFF';  TextSecondary = '#C8C8C8'; TextTertiary = '#9A9A9A'
+        TextMuted   = '#7A7A7A';  TextDisabled  = '#5C5C5C'
+        CardBg = '#2B2B2B';  CardBgTranslucent = '#C42B2B2B'
+        CardBorder = '#14FFFFFF'; Hairline = '#0FFFFFFF'
+        RootTop = '#212121'; RootBottom = '#1E1E1E'
+        RootTopTranslucent = '#B0212121'; RootBottomTranslucent = '#B01E1E1E'
+        SubtleFill = '#0FFFFFFF'; SubtleFillHover = '#17FFFFFF'; SubtleFillDisabled = '#08FFFFFF'
+        OverlayHover = '#14FFFFFF'; OverlayPressed = '#0AFFFFFF'
+        SwitchOffBorder = '#8A8A8A'; SwitchOffKnob = '#9A9A9A'
+        SwitchOffBorderHover = '#C8C8C8'; SwitchOffKnobHover = '#C8C8C8'
+        BadgeOkText = '#6CCB5F';   BadgeOkBg = '#1F6CCB5F'
+        BadgeWarnText = '#FF99A4'; BadgeWarnBg = '#26FF99A4'
+        BadgeAlertText = '#FFC8A4'; BadgeAlertBg = '#26FFC8A4'
+        BadgeOffText = '#9A9A9A';  BadgeOffBg = '#14FFFFFF'
+        TipBg = '#323232'; TipFg = '#FFFFFF'; TipBorder = '#26FFFFFF'
+        Shadow = '#000000'; ShadowTranslucent = '#2E000000'; ShadowEffectOpacity = 0.5
+        CloseHover = '#C42B1C'; ClosePressed = '#B02A1C'; OnClose = '#FFFFFF'
+        Scrim = '#D9202020'      # 壁纸材质上盖的遮罩：决定"透过玻璃看壁纸"的浓度
+        AccentMix = 0.45         # 正文强调色 = 强调色掺白/掺黑的比例
+    }
+    light = @{
+        TextPrimary = '#1B1B1B';  TextSecondary = '#444444'; TextTertiary = '#5E5E5E'
+        TextMuted   = '#7A7A7A';  TextDisabled  = '#A8A8A8'
+        CardBg = '#FFFFFF';  CardBgTranslucent = '#DFFFFFFF'
+        CardBorder = '#19000000'; Hairline = '#10000000'
+        RootTop = '#F7F7F7'; RootBottom = '#EFEFEF'
+        RootTopTranslucent = '#C6F7F7F7'; RootBottomTranslucent = '#C6EFEFEF'
+        SubtleFill = '#0D000000'; SubtleFillHover = '#16000000'; SubtleFillDisabled = '#08000000'
+        OverlayHover = '#12000000'; OverlayPressed = '#0D000000'
+        SwitchOffBorder = '#868686'; SwitchOffKnob = '#5D5D5D'
+        SwitchOffBorderHover = '#1B1B1B'; SwitchOffKnobHover = '#1B1B1B'
+        BadgeOkText = '#0E7A38';   BadgeOkBg = '#1F0E7A38'
+        BadgeWarnText = '#C42B1C'; BadgeWarnBg = '#22C42B1C'
+        BadgeAlertText = '#9A4A00'; BadgeAlertBg = '#229A4A00'
+        BadgeOffText = '#5E5E5E';  BadgeOffBg = '#14000000'
+        TipBg = '#F9F9F9'; TipFg = '#1B1B1B'; TipBorder = '#1F000000'
+        Shadow = '#000000'; ShadowTranslucent = '#24000000'; ShadowEffectOpacity = 0.22
+        CloseHover = '#C42B1C'; ClosePressed = '#B02A1C'; OnClose = '#FFFFFF'
+        Scrim = '#E3F3F3F3'
+        AccentMix = -0.25
+    }
+}
+# 老代码里还有按十六进制取刷子的地方，先过一层语义别名，浅色下才会跟着换
+$script:ThemeColorAlias = @{
+    '#FFFFFF' = 'TextPrimary';  '#C8C8C8' = 'TextSecondary'; '#9A9A9A' = 'TextTertiary'
+    '#7A7A7A' = 'TextMuted';    '#5C5C5C' = 'TextDisabled'
+    '#2B2B2B' = 'CardBg';       '#14FFFFFF' = 'CardBorder';  '#0FFFFFFF' = 'Hairline'
+    '#6CCB5F' = 'BadgeOkText';  '#1F6CCB5F' = 'BadgeOkBg'
+    '#FF99A4' = 'BadgeWarnText'; '#26FF99A4' = 'BadgeWarnBg'
+    '#FFC8A4' = 'BadgeAlertText'; '#26FFC8A4' = 'BadgeAlertBg'
+    '#79C0FF' = 'AccentText';   '#323232' = 'TipBg'; '#26FFFFFF' = 'TipBorder'
+}
 $script:BrushCache = @{}
-function Get-Brush {
+function Get-BrushRaw {
     param([string]$Hex)
     if (-not $script:BrushCache.ContainsKey($Hex)) {
         $color = [System.Windows.Media.ColorConverter]::ConvertFromString($Hex)
         $script:BrushCache[$Hex] = [System.Windows.Media.SolidColorBrush]::new($color)
     }
     return $script:BrushCache[$Hex]
+}
+function Get-Brush {
+    # 兼容老调用点：先查语义别名（浅色主题要跟着换色），否则按字面量返回
+    param([string]$Hex)
+    if ($script:Resources -and $script:ThemeColorAlias.ContainsKey($Hex)) {
+        $b = $script:Resources[($script:ThemeColorAlias[$Hex] + 'Brush')]
+        if ($b) { return $b }
+    }
+    return (Get-BrushRaw $Hex)
+}
+function Get-ThemeBrush {
+    param([string]$Key)
+    if ($script:Resources) {
+        $b = $script:Resources[$Key + 'Brush']
+        if ($b) { return $b }
+    }
+    $p = $script:ThemePalettes[$script:ThemeApplied]
+    if ($p.ContainsKey($Key)) { return (Get-BrushRaw $p[$Key]) }
+    return (Get-BrushRaw '#9A9A9A')
+}
+function Get-Color { param([string]$Hex) return [System.Windows.Media.Color]$([System.Windows.Media.ColorConverter]::ConvertFromString($Hex)) }
+
+function Set-ResourceBrush {
+    # 坑：PowerShell 对 ResourceDictionary 的索引器赋值会把某些刚 new 出来的 Freezable
+    # 传成别的东西（实测报「"X" 不是属性 Background 的有效值」）。Remove + Add 才是稳的。
+    param($Dict, [string]$Key, $Value)
+    try {
+        $Dict[$Key] = $Value
+    } catch {
+        [void]$Dict.Remove($Key)
+        $Dict.Add($Key, $Value)
+    }
+}
+
+function Get-EffectiveTheme {
+    if ($script:ThemeChoice -eq 'dark' -or $script:ThemeChoice -eq 'light') { return $script:ThemeChoice }
+    try {
+        $v = (Get-ItemProperty -LiteralPath 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Themes\Personalize' -ErrorAction Stop).AppsUseLightTheme
+        if ($v -eq 1) { return 'light' }
+        return 'dark'
+    } catch { return 'dark' }
+}
+function Apply-Theme {
+    param([switch]$Force, [string]$Reason = 'startup')
+    $want = Get-EffectiveTheme
+    if (-not $Force -and $want -eq $script:ThemeApplied) { return $false }
+    $script:ThemeApplied = $want
+    Update-AppearanceBrushes
+    Update-TooltipsTheme
+    Write-Log "theme = $want ($Reason)"
+    return $true
+}
+function Sync-ThemeFromSystem {
+    # 没做 WndProc 钩子：跟随系统就走 3.6 秒一次的轮询（读一个 REG_DWORD，代价可以忽略）
+    if ($script:ThemeChoice -ne 'system') { return }
+    [void](Apply-Theme -Reason 'system change')
+}
+function Update-AppearanceBrushes {
+    if (-not $script:Resources) { return }
+    $res = $script:Resources
+    $p = $script:ThemePalettes[$script:ThemeApplied]
+    foreach ($k in @('TextPrimary', 'TextSecondary', 'TextTertiary', 'TextMuted', 'TextDisabled',
+                     'CardBorder', 'Hairline', 'SubtleFill', 'SubtleFillHover', 'SubtleFillDisabled',
+                     'OverlayHover', 'OverlayPressed', 'SwitchOffBorder', 'SwitchOffKnob',
+                     'SwitchOffBorderHover', 'SwitchOffKnobHover', 'BadgeOkText', 'BadgeOkBg',
+                     'BadgeWarnText', 'BadgeWarnBg', 'BadgeAlertText', 'BadgeAlertBg',
+                     'BadgeOffText', 'BadgeOffBg', 'TipBg', 'TipFg', 'TipBorder',
+                     'CloseHover', 'ClosePressed', 'OnClose')) {
+        Set-ResourceBrush $res ($k + 'Brush') (Get-BrushRaw $p[$k])
+    }
+    # 正文里的强调色：深色掺白、浅色掺黑（AccentMix 负值 = 掺黑）
+    $mix = [double]$p.AccentMix
+    if ($mix -ge 0) { $at = Mix-Color $script:AccentColor $script:WhiteColor $mix }
+    else            { $at = Mix-Color $script:AccentColor $script:BlackColor ([Math]::Abs($mix)) }
+    Set-ResourceBrush $res 'AccentTextBrush' ([System.Windows.Media.SolidColorBrush]::new($at))
+    $translucent = ($script:MaterialChoice -eq 'translucent')
+    Set-ResourceBrush $res 'CardBgBrush' (Get-BrushRaw $(if ($translucent) { $p.CardBgTranslucent } else { $p.CardBg }))
+    Set-ResourceBrush $res 'ShadowBrush' (Get-BrushRaw $(if ($translucent) { $p.ShadowTranslucent } else { $p.Shadow }))
+    Set-ResourceBrush $res 'RootCardBrush' (New-RootCardBrush)
+    $layer = $script:Ui['ShadowLayer']
+    if ($layer -and $layer.Effect) {
+        try { $layer.Effect.Opacity = [double]$p.ShadowEffectOpacity } catch { }
+    }
+}
+function Update-TooltipsTheme {
+    if (-not $script:TipElements) { return }
+    foreach ($t in $script:TipElements) {
+        try {
+            $t.Background  = Get-ThemeBrush 'TipBg'
+            $t.Foreground  = Get-ThemeBrush 'TipFg'
+            $t.BorderBrush = Get-ThemeBrush 'TipBorder'
+        } catch { }
+    }
+}
+function Set-ThemeChoice {
+    param([string]$Choice)
+    if (@('dark', 'light', 'system') -notcontains $Choice) { return }
+    if ($Choice -eq $script:ThemeChoice) { return }
+    $script:ThemeChoice = $Choice
+    Save-LauncherSettings
+    [void](Apply-Theme -Force -Reason 'user')
+    Write-Log "theme choice = $Choice"
+}
+function Set-MaterialChoice {
+    param([string]$Material)
+    if (@('opaque', 'translucent', 'wallpaper') -notcontains $Material) { return }
+    if ($Material -eq $script:MaterialChoice) { return }
+    $script:MaterialChoice = $Material
+    Save-LauncherSettings
+    Update-AppearanceBrushes
+    Update-MaterialHint
+    Write-Log "material = $Material"
+}
+function Update-MaterialHint {
+    $t = $script:Ui['MatHint']
+    if (-not $t) { return }
+    if ($script:MaterialChoice -eq 'wallpaper') {
+        if ($script:WallpaperMissing) { $t.Text = '没读到桌面壁纸，先按实色显示' }
+        else { $t.Text = '壁纸调色 + 强调色，近似 Mica' }
+    } elseif ($script:MaterialChoice -eq 'translucent') {
+        $t.Text = '能看穿到桌面（无毛玻璃模糊）'
+    } else {
+        $t.Text = '实色卡片，最省电'
+    }
+}
+
+# -- 背景材质：不透明 / 半透明 / 壁纸取色（仿 Mica）------------------------------
+# 实测记录（本机 28020）：DWMWA_SYSTEMBACKDROP_TYPE 调用返回 S_OK 但对 WPF 窗口毫无效果，
+# DWMWA_MICA_EFFECT(1029) 直接 E_INVALIDARG，SetWindowCompositionAttribute 返回 TRUE 也没画面，
+# 所以真正的 Mica/亚克力在 WPF（HWND 重定向表面）里拿不到。这里用「壁纸取色 + 遮罩」自己凑
+# 一个 Mica 观感：壁纸两级降采样成一团糊，再盖强调色和主题遮罩。
+if (-not ('BasaltLauncherTheme' -as [type])) {
+    $sigSrc = (@(
+        '[System.Runtime.InteropServices.DllImport("user32.dll", CharSet = System.Runtime.InteropServices.CharSet.Unicode)]',
+        'public static extern bool SystemParametersInfo(int uiAction, int uiParam, System.Text.StringBuilder pvParam, int fWinIni);'
+    ) -join [string][char]13 + [string][char]10)
+    try { Add-Type -Name BasaltLauncherTheme -MemberDefinition $sigSrc } catch { }
+}
+$script:WallpaperSource = $null
+$script:WallpaperTried = $false
+$script:WallpaperMissing = $false
+function Resize-CoverImage {
+    param($Img, [int]$W, [int]$H)
+    # cover：居中裁切比例填满，避免拉扁
+    $ratio = [Math]::Max($W / $Img.Width, $H / $Img.Height)
+    $sw = [int][Math]::Round($Img.Width * $ratio)
+    $sh = [int][Math]::Round($Img.Height * $ratio)
+    $dst = New-Object System.Drawing.Bitmap($W, $H, [System.Drawing.Imaging.PixelFormat]::Format32bppArgb)
+    $g = [System.Drawing.Graphics]::FromImage($dst)
+    $g.InterpolationMode = [System.Drawing.Drawing2D.InterpolationMode]::HighQualityBicubic
+    $g.PixelOffsetMode = [System.Drawing.Drawing2D.PixelOffsetMode]::HighQuality
+    $g.DrawImage($Img, [int](($W - $sw) / 2), [int](($H - $sh) / 2), $sw, $sh)
+    $g.Dispose()
+    return $dst
+}
+function Get-WallpaperImageSource {
+    if ($script:WallpaperTried) { return $script:WallpaperSource }
+    $script:WallpaperTried = $true
+    try {
+        $path = $null
+        try {
+            $sb = New-Object System.Text.StringBuilder 600
+            [void][BasaltLauncherTheme]::SystemParametersInfo(0x0073, $sb.Capacity, $sb, 0)   # SPI_GETDESKWALLPAPER
+            $path = $sb.ToString()
+        } catch { }
+        if (-not $path -or -not (Test-Path -LiteralPath $path)) {
+            try { $path = [string](Get-ItemProperty -LiteralPath 'HKCU:\Control Panel\Desktop').WallPaper } catch { }
+        }
+        if (-not $path -or -not (Test-Path -LiteralPath $path)) {
+            # 「聚焦」锁屏壁纸目录（文件没扩展名，挑一张最大的）
+            try {
+                $assets = Join-Path $env:LOCALAPPDATA 'Packages\Microsoft.Windows.ContentDeliveryManager_cw5n1h2txyewy\LocalState\Assets'
+                if (Test-Path -LiteralPath $assets) {
+                    $cand = Get-ChildItem -LiteralPath $assets -File | Where-Object { $_.Length -gt 300000 } |
+                            Sort-Object Length -Descending | Select-Object -First 1
+                    if ($cand) { $path = $cand.FullName }
+                }
+            } catch { }
+        }
+        if (-not $path -or -not (Test-Path -LiteralPath $path)) {
+            $script:WallpaperMissing = $true
+            Write-Log 'material: no readable wallpaper, wallpaper look falls back to solid'
+            return $null
+        }
+        Add-Type -AssemblyName System.Drawing
+        $bytes = [System.IO.File]::ReadAllBytes($path)
+        $ms = New-Object System.IO.MemoryStream(, $bytes)
+        $src = [System.Drawing.Image]::FromStream($ms)
+        $mid = Resize-CoverImage $src 400 240
+        $small = Resize-CoverImage $mid 88 54          # 两级降采样 = 便宜的模糊
+        $src.Dispose(); $mid.Dispose(); $ms.Dispose()
+        $out = New-Object System.IO.MemoryStream
+        $small.Save($out, [System.Drawing.Imaging.ImageFormat]::Png)
+        $small.Dispose()
+        $out.Position = 0
+        $bi = [System.Windows.Media.Imaging.BitmapImage]::new()
+        $bi.CacheOption = [System.Windows.Media.Imaging.BitmapCacheOption]::OnLoad
+        $bi.BeginInit()
+        $bi.StreamSource = $out
+        $bi.EndInit()
+        if ($bi.CanFreeze) { $bi.Freeze() }
+        $script:WallpaperSource = $bi
+        Write-Log "material: wallpaper tint from $path"
+        return $bi
+    } catch {
+        $script:WallpaperMissing = $true
+        Write-Log "material: wallpaper load failed: $($_.Exception.Message)"
+        return $null
+    }
+}
+function New-WallpaperTintBrush {
+    # 返回一个 DrawingBrush：壁纸糊图 + 强调色调色 + 主题遮罩，一张画刷搞定整张卡片
+    $img = Get-WallpaperImageSource
+    if (-not $img) { return $null }
+    $p = $script:ThemePalettes[$script:ThemeApplied]
+    $box = [System.Windows.Media.RectangleGeometry]::new([System.Windows.Rect]::new(0, 0, 1, 1))
+    if ($box.CanFreeze) { $box.Freeze() }   # 同一个几何要复用三次，不冻结会被当成多父节点
+    $group = [System.Windows.Media.DrawingGroup]::new()
+    $ib = [System.Windows.Media.ImageBrush]::new($img)
+    $ib.Stretch = [System.Windows.Media.Stretch]::Fill
+    [void]$group.Children.Add([System.Windows.Media.GeometryDrawing]::new($ib, $null, $box))
+    $tint = [System.Windows.Media.Color]::FromArgb(28, $script:AccentColor.R, $script:AccentColor.G, $script:AccentColor.B)
+    [void]$group.Children.Add(([System.Windows.Media.GeometryDrawing]::new(
+        [System.Windows.Media.SolidColorBrush]::new($tint), $null, $box)))
+    [void]$group.Children.Add(([System.Windows.Media.GeometryDrawing]::new(
+        (Get-BrushRaw $p.Scrim), $null, $box)))
+    $db = [System.Windows.Media.DrawingBrush]::new($group)
+    $db.Stretch = [System.Windows.Media.Stretch]::Fill
+    if ($db.CanFreeze) { $db.Freeze() }
+    return $db
+}
+function New-RootCardBrush {
+    $p = $script:ThemePalettes[$script:ThemeApplied]
+    $mat = $script:MaterialChoice
+    if ($mat -eq 'wallpaper') {
+        $wb = New-WallpaperTintBrush
+        if ($wb) { return $wb }
+        $mat = 'opaque'      # 没壁纸就老实回退成实色
+    }
+    $top = if ($mat -eq 'translucent') { $p.RootTopTranslucent } else { $p.RootTop }
+    $bot = if ($mat -eq 'translucent') { $p.RootBottomTranslucent } else { $p.RootBottom }
+    $gb = [System.Windows.Media.LinearGradientBrush]::new()
+    $gb.StartPoint = [System.Windows.Point]::new(0, 0)
+    $gb.EndPoint = [System.Windows.Point]::new(0, 1)
+    [void]$gb.GradientStops.Add([System.Windows.Media.GradientStop]::new((Get-Color $top), 0))
+    [void]$gb.GradientStops.Add([System.Windows.Media.GradientStop]::new((Get-Color $bot), 1))
+    if ($gb.CanFreeze) { $gb.Freeze() }
+    return $gb
 }
 
 # ---------------------------------------------------------------- 服务状态 --
@@ -503,6 +837,51 @@ function Set-Autostart {
     Sync-AutostartUi
 }
 
+# ------------------------------------------------ 启动器自身的开机自启 --
+# 和上面那条 BasaltLocalAI 是两回事：那条管「登录后加载模型」，这条只管
+# 「登录后把启动器自己拉起来、收在托盘里」。启动器不碰引擎，两边不会重复加载。
+function Get-LauncherAutostartInfo {
+    try {
+        $item = Get-ItemProperty -Path $script:RunKey -Name $script:LauncherRunValue -ErrorAction Stop
+        $value = [string]$item.PSObject.Properties[$script:LauncherRunValue].Value
+        $target = ''
+        if ($value -match '"([^"]+)"') { $target = $matches[1] }
+        elseif ($value -match '(?i)(\S+\.vbs)') { $target = $matches[1] }
+        return [pscustomobject]@{
+            On      = $true
+            Command = $value
+            Target  = $target
+            Missing = ($target -ne '' -and -not (Test-Path -LiteralPath $target))
+            NoFlag  = ($value -notmatch '-StartInTray')   # 手写的老值：登录会弹窗口
+        }
+    } catch {
+        return [pscustomobject]@{ On = $false; Command = ''; Target = ''; Missing = $false; NoFlag = $false }
+    }
+}
+
+function Set-LauncherAutostart {
+    param([bool]$Enable)
+    try {
+        if ($Enable) {
+            $vbs = Join-Path $script:LauncherDir 'launch.vbs'
+            if (-not (Test-Path -LiteralPath $vbs)) { throw '缺少 launcher\launch.vbs，无法注册自启动' }
+            $value = 'wscript.exe "' + $vbs + '" -StartInTray'
+            New-ItemProperty -Path $script:RunKey -Name $script:LauncherRunValue -Value $value `
+                -PropertyType String -Force | Out-Null
+            Write-Log "launcher autostart enabled -> $value"
+            Show-Toast '已开启：登录后启动器收在托盘里（只挂图标，不加载模型）' 'ok'
+        } else {
+            Remove-ItemProperty -Path $script:RunKey -Name $script:LauncherRunValue -ErrorAction SilentlyContinue
+            Write-Log 'launcher autostart disabled'
+            Show-Toast '已关闭启动器开机自启（当前窗口和服务都不受影响）' 'ok'
+        }
+    } catch {
+        Write-Log "launcher autostart failed: $($_.Exception.Message)"
+        Show-Toast ('设置失败：' + $_.Exception.Message) 'error'
+    }
+    Sync-LauncherAutostartUi
+}
+
 # ---------------------------------------------------------------- 界面状态 --
 $script:StartProc = $null
 $script:StopProc  = $null
@@ -514,6 +893,7 @@ $script:Snap      = $null
 $script:Tick      = 0
 $script:Toast     = $null
 $script:SuppressToggle = $false
+$script:SuppressLauncherToggle = $false
 $script:SpinStory = $null
 $script:Ui        = @{}
 
@@ -730,7 +1110,7 @@ function Update-Ui {
     # 收在托盘时，别的实例（比如又双击了一次快捷方式）会留下「请显示」的凭据
     if ($script:Hidden) { Test-ShowRequest }
 
-    if (($script:Tick % 3) -eq 1) { Sync-AutostartUi }
+    if (($script:Tick % 3) -eq 1) { Sync-AutostartUi; Sync-LauncherAutostartUi; Sync-ThemeFromSystem }
 }
 
 function Set-TooltipText {
@@ -762,6 +1142,39 @@ function Sync-AutostartUi {
         $script:Ui.TxtAutoState.Foreground = Get-Brush '#9A9A9A'
         $script:Ui.AutoBadge.Background = Get-Brush '#14FFFFFF'
         Set-TooltipText $script:Ui.ToggleAuto '登录 Windows 后静默加载服务'
+    }
+}
+
+function Sync-LauncherAutostartUi {
+    $info = Get-LauncherAutostartInfo
+    $script:SuppressLauncherToggle = $true
+    try { $script:Ui.ToggleLauncher.IsChecked = [bool]$info.On } finally { $script:SuppressLauncherToggle = $false }
+    if ($script:MenuLauncherAuto) { $script:MenuLauncherAuto.Checked = [bool]$info.On }
+
+    if (-not $info.On) {
+        $script:Ui.TxtLauncherState.Text = '已关闭'
+        $script:Ui.TxtLauncherState.Foreground = Get-Brush '#9A9A9A'
+        $script:Ui.LauncherBadge.Background = Get-Brush '#14FFFFFF'
+        Set-TooltipText $script:Ui.ToggleLauncher '登录 Windows 后把启动器收进托盘（模型由上面那条自启加载）'
+        return
+    }
+    if ($info.Missing) {
+        $script:Ui.TxtLauncherState.Text = '已开启 · 目标缺失'
+        $script:Ui.TxtLauncherState.Foreground = Get-Brush '#FF99A4'
+        $script:Ui.LauncherBadge.Background = Get-Brush '#26FF99A4'
+    } elseif ($info.NoFlag) {
+        $script:Ui.TxtLauncherState.Text = '已开启 · 会弹窗'
+        $script:Ui.TxtLauncherState.Foreground = Get-Brush '#FFC8A4'
+        $script:Ui.LauncherBadge.Background = Get-Brush '#26FFC8A4'
+    } else {
+        $script:Ui.TxtLauncherState.Text = '已开启'
+        $script:Ui.TxtLauncherState.Foreground = Get-Brush '#6CCB5F'
+        $script:Ui.LauncherBadge.Background = Get-Brush '#1F6CCB5F'
+    }
+    if ($info.NoFlag) {
+        Set-TooltipText $script:Ui.ToggleLauncher ($info.Command + "`n这条没有 -StartInTray：登录会弹窗口，关掉再打开一次就好")
+    } else {
+        Set-TooltipText $script:Ui.ToggleLauncher $info.Command
     }
 }
 
@@ -927,6 +1340,11 @@ try { [void][BasaltLauncherNative]::SetCurrentProcessExplicitAppUserModelID($scr
 $script:Mutex = $null
 try {
     $script:Mutex = [System.Threading.Mutex]::OpenExisting('Local\BasaltLauncher')
+    if ($script:StartInTray) {
+        # 登录自启撞上已有一个实例：不叫它弹窗口，自己安静退出（老实例里跑的是旧代码）
+        Write-Log 'second instance: -StartInTray, leaving the running one alone'
+        return
+    }
     # 已经有一个启动器：把它从最小化/背后叫出来
     try {
         $hwnd = [BasaltLauncherNative]::FindWindow([NullString]::Value, 'Basalt 启动器')
@@ -963,18 +1381,57 @@ Add-Type -AssemblyName WindowsBase
 $xamlText = @'
 <Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
-        Title="Basalt 启动器" Width="496" Height="412"
+        Title="Basalt 启动器" Width="496" Height="636"
         WindowStyle="None" AllowsTransparency="True" Background="Transparent"
         ResizeMode="NoResize" WindowStartupLocation="CenterScreen"
         UseLayoutRounding="True" SnapsToDevicePixels="True"
         TextOptions.TextFormattingMode="Display"
-        FontFamily="Segoe UI Variable Text, Microsoft YaHei UI" FontSize="14" Foreground="#FFFFFF">
+        FontFamily="Segoe UI Variable Text, Microsoft YaHei UI" FontSize="14" Foreground="{DynamicResource TextPrimaryBrush}">
   <Window.Resources>
     <!-- 强调色：加载后按系统强调色替换（DynamicResource 保证换刷子也能刷新） -->
     <SolidColorBrush x:Key="AccentBrush" Color="#0078D4"/>
     <SolidColorBrush x:Key="AccentHoverBrush" Color="#1A88DC"/>
     <SolidColorBrush x:Key="AccentPressedBrush" Color="#0069BA"/>
     <SolidColorBrush x:Key="OnAccentBrush" Color="#FFFFFF"/>
+
+    <!-- 主题调色板默认值 = 深色；Apply-Theme 在窗口建好后立刻按 深色/浅色/跟随系统 覆盖这些键 -->
+    <SolidColorBrush x:Key="TextPrimaryBrush" Color="#FFFFFF"/>
+    <SolidColorBrush x:Key="TextSecondaryBrush" Color="#C8C8C8"/>
+    <SolidColorBrush x:Key="TextTertiaryBrush" Color="#9A9A9A"/>
+    <SolidColorBrush x:Key="TextMutedBrush" Color="#7A7A7A"/>
+    <SolidColorBrush x:Key="TextDisabledBrush" Color="#5C5C5C"/>
+    <SolidColorBrush x:Key="AccentTextBrush" Color="#79C0FF"/>
+    <SolidColorBrush x:Key="CardBgBrush" Color="#2B2B2B"/>
+    <SolidColorBrush x:Key="CardBorderBrush" Color="#14FFFFFF"/>
+    <SolidColorBrush x:Key="HairlineBrush" Color="#0FFFFFFF"/>
+    <SolidColorBrush x:Key="SubtleFillBrush" Color="#0FFFFFFF"/>
+    <SolidColorBrush x:Key="SubtleFillHoverBrush" Color="#17FFFFFF"/>
+    <SolidColorBrush x:Key="SubtleFillDisabledBrush" Color="#08FFFFFF"/>
+    <SolidColorBrush x:Key="OverlayHoverBrush" Color="#14FFFFFF"/>
+    <SolidColorBrush x:Key="OverlayPressedBrush" Color="#0AFFFFFF"/>
+    <SolidColorBrush x:Key="SwitchOffBorderBrush" Color="#8A8A8A"/>
+    <SolidColorBrush x:Key="SwitchOffKnobBrush" Color="#9A9A9A"/>
+    <SolidColorBrush x:Key="SwitchOffBorderHoverBrush" Color="#C8C8C8"/>
+    <SolidColorBrush x:Key="SwitchOffKnobHoverBrush" Color="#C8C8C8"/>
+    <SolidColorBrush x:Key="BadgeOkTextBrush" Color="#6CCB5F"/>
+    <SolidColorBrush x:Key="BadgeOkBgBrush" Color="#1F6CCB5F"/>
+    <SolidColorBrush x:Key="BadgeWarnTextBrush" Color="#FF99A4"/>
+    <SolidColorBrush x:Key="BadgeWarnBgBrush" Color="#26FF99A4"/>
+    <SolidColorBrush x:Key="BadgeAlertTextBrush" Color="#FFC8A4"/>
+    <SolidColorBrush x:Key="BadgeAlertBgBrush" Color="#26FFC8A4"/>
+    <SolidColorBrush x:Key="BadgeOffTextBrush" Color="#9A9A9A"/>
+    <SolidColorBrush x:Key="BadgeOffBgBrush" Color="#14FFFFFF"/>
+    <SolidColorBrush x:Key="TipBgBrush" Color="#323232"/>
+    <SolidColorBrush x:Key="TipFgBrush" Color="#FFFFFF"/>
+    <SolidColorBrush x:Key="TipBorderBrush" Color="#26FFFFFF"/>
+    <SolidColorBrush x:Key="ShadowBrush" Color="#000000"/>
+    <SolidColorBrush x:Key="CloseHoverBrush" Color="#C42B1C"/>
+    <SolidColorBrush x:Key="ClosePressedBrush" Color="#B02A1C"/>
+    <SolidColorBrush x:Key="OnCloseBrush" Color="#FFFFFF"/>
+    <LinearGradientBrush x:Key="RootCardBrush" StartPoint="0,0" EndPoint="0,1">
+      <GradientStop Color="#212121" Offset="0"/>
+      <GradientStop Color="#1E1E1E" Offset="1"/>
+    </LinearGradientBrush>
 
     <Style x:Key="Glyph" TargetType="TextBlock">
       <Setter Property="FontFamily" Value="Segoe Fluent Icons, Segoe MDL2 Assets"/>
@@ -984,7 +1441,7 @@ $xamlText = @'
     <Style x:Key="CaptionButton" TargetType="Button">
       <Setter Property="Width" Value="42"/>
       <Setter Property="Height" Value="30"/>
-      <Setter Property="Foreground" Value="#C8C8C8"/>
+      <Setter Property="Foreground" Value="{DynamicResource TextSecondaryBrush}"/>
       <Setter Property="Background" Value="Transparent"/>
       <Setter Property="Cursor" Value="Hand"/>
       <Setter Property="FocusVisualStyle" Value="{x:Null}"/>
@@ -996,11 +1453,11 @@ $xamlText = @'
             </Border>
             <ControlTemplate.Triggers>
               <Trigger Property="IsMouseOver" Value="True">
-                <Setter TargetName="Bd" Property="Background" Value="#14FFFFFF"/>
-                <Setter Property="Foreground" Value="#FFFFFF"/>
+                <Setter TargetName="Bd" Property="Background" Value="{DynamicResource OverlayHoverBrush}"/>
+                <Setter Property="Foreground" Value="{DynamicResource TextPrimaryBrush}"/>
               </Trigger>
               <Trigger Property="IsPressed" Value="True">
-                <Setter TargetName="Bd" Property="Background" Value="#0AFFFFFF"/>
+                <Setter TargetName="Bd" Property="Background" Value="{DynamicResource OverlayPressedBrush}"/>
               </Trigger>
             </ControlTemplate.Triggers>
           </ControlTemplate>
@@ -1017,11 +1474,11 @@ $xamlText = @'
             </Border>
             <ControlTemplate.Triggers>
               <Trigger Property="IsMouseOver" Value="True">
-                <Setter TargetName="Bd" Property="Background" Value="#C42B1C"/>
-                <Setter Property="Foreground" Value="#FFFFFF"/>
+                <Setter TargetName="Bd" Property="Background" Value="{DynamicResource CloseHoverBrush}"/>
+                <Setter Property="Foreground" Value="{DynamicResource OnCloseBrush}"/>
               </Trigger>
               <Trigger Property="IsPressed" Value="True">
-                <Setter TargetName="Bd" Property="Background" Value="#B02A1C"/>
+                <Setter TargetName="Bd" Property="Background" Value="{DynamicResource ClosePressedBrush}"/>
               </Trigger>
             </ControlTemplate.Triggers>
           </ControlTemplate>
@@ -1048,8 +1505,8 @@ $xamlText = @'
                 <Setter TargetName="Bd" Property="Background" Value="{DynamicResource AccentPressedBrush}"/>
               </Trigger>
               <Trigger Property="IsEnabled" Value="False">
-                <Setter TargetName="Bd" Property="Background" Value="#0FFFFFFF"/>
-                <Setter Property="Foreground" Value="#5C5C5C"/>
+                <Setter TargetName="Bd" Property="Background" Value="{DynamicResource SubtleFillBrush}"/>
+                <Setter Property="Foreground" Value="{DynamicResource TextDisabledBrush}"/>
                 <Setter Property="Cursor" Value="Arrow"/>
               </Trigger>
             </ControlTemplate.Triggers>
@@ -1059,9 +1516,9 @@ $xamlText = @'
     </Style>
 
     <Style x:Key="SecondaryButton" TargetType="Button">
-      <Setter Property="Foreground" Value="#FFFFFF"/>
-      <Setter Property="Background" Value="#0FFFFFFF"/>
-      <Setter Property="BorderBrush" Value="#14FFFFFF"/>
+      <Setter Property="Foreground" Value="{DynamicResource TextPrimaryBrush}"/>
+      <Setter Property="Background" Value="{DynamicResource SubtleFillBrush}"/>
+      <Setter Property="BorderBrush" Value="{DynamicResource CardBorderBrush}"/>
       <Setter Property="Cursor" Value="Hand"/>
       <Setter Property="FocusVisualStyle" Value="{x:Null}"/>
       <Setter Property="Template">
@@ -1074,15 +1531,15 @@ $xamlText = @'
             </Border>
             <ControlTemplate.Triggers>
               <Trigger Property="IsMouseOver" Value="True">
-                <Setter TargetName="Bd" Property="Background" Value="#17FFFFFF"/>
+                <Setter TargetName="Bd" Property="Background" Value="{DynamicResource SubtleFillHoverBrush}"/>
               </Trigger>
               <Trigger Property="IsPressed" Value="True">
-                <Setter TargetName="Bd" Property="Background" Value="#0AFFFFFF"/>
+                <Setter TargetName="Bd" Property="Background" Value="{DynamicResource OverlayPressedBrush}"/>
               </Trigger>
               <Trigger Property="IsEnabled" Value="False">
-                <Setter TargetName="Bd" Property="Background" Value="#08FFFFFF"/>
-                <Setter TargetName="Bd" Property="BorderBrush" Value="#0FFFFFFF"/>
-                <Setter Property="Foreground" Value="#5C5C5C"/>
+                <Setter TargetName="Bd" Property="Background" Value="{DynamicResource SubtleFillDisabledBrush}"/>
+                <Setter TargetName="Bd" Property="BorderBrush" Value="{DynamicResource HairlineBrush}"/>
+                <Setter Property="Foreground" Value="{DynamicResource TextDisabledBrush}"/>
                 <Setter Property="Cursor" Value="Arrow"/>
               </Trigger>
             </ControlTemplate.Triggers>
@@ -1092,7 +1549,7 @@ $xamlText = @'
     </Style>
 
     <Style x:Key="LinkButton" TargetType="Button">
-      <Setter Property="Foreground" Value="#C8C8C8"/>
+      <Setter Property="Foreground" Value="{DynamicResource TextSecondaryBrush}"/>
       <Setter Property="Background" Value="Transparent"/>
       <Setter Property="Cursor" Value="Hand"/>
       <Setter Property="Padding" Value="10,4"/>
@@ -1106,11 +1563,11 @@ $xamlText = @'
             </Border>
             <ControlTemplate.Triggers>
               <Trigger Property="IsMouseOver" Value="True">
-                <Setter TargetName="Bd" Property="Background" Value="#0FFFFFFF"/>
-                <Setter Property="Foreground" Value="#FFFFFF"/>
+                <Setter TargetName="Bd" Property="Background" Value="{DynamicResource SubtleFillBrush}"/>
+                <Setter Property="Foreground" Value="{DynamicResource TextPrimaryBrush}"/>
               </Trigger>
               <Trigger Property="IsPressed" Value="True">
-                <Setter TargetName="Bd" Property="Background" Value="#08FFFFFF"/>
+                <Setter TargetName="Bd" Property="Background" Value="{DynamicResource SubtleFillDisabledBrush}"/>
               </Trigger>
             </ControlTemplate.Triggers>
           </ControlTemplate>
@@ -1128,14 +1585,14 @@ $xamlText = @'
           <ControlTemplate TargetType="ToggleButton">
             <Grid Background="Transparent">
               <Border x:Name="Track" CornerRadius="10" Background="Transparent"
-                      BorderBrush="#8A8A8A" BorderThickness="1"/>
-              <Ellipse x:Name="Knob" Width="12" Height="12" Fill="#9A9A9A"
+                      BorderBrush="{DynamicResource SwitchOffBorderBrush}" BorderThickness="1"/>
+              <Ellipse x:Name="Knob" Width="12" Height="12" Fill="{DynamicResource SwitchOffKnobBrush}"
                        HorizontalAlignment="Left" Margin="4,0,0,0"/>
             </Grid>
             <ControlTemplate.Triggers>
               <Trigger Property="IsMouseOver" Value="True">
-                <Setter TargetName="Track" Property="BorderBrush" Value="#C8C8C8"/>
-                <Setter TargetName="Knob" Property="Fill" Value="#C8C8C8"/>
+                <Setter TargetName="Track" Property="BorderBrush" Value="{DynamicResource SwitchOffBorderHoverBrush}"/>
+                <Setter TargetName="Knob" Property="Fill" Value="{DynamicResource SwitchOffKnobHoverBrush}"/>
               </Trigger>
               <Trigger Property="IsChecked" Value="True">
                 <Setter TargetName="Track" Property="Background" Value="{DynamicResource AccentBrush}"/>
@@ -1153,23 +1610,46 @@ $xamlText = @'
         </Setter.Value>
       </Setter>
     </Style>
+    <!-- 分段选择器（主题 / 材质用）：RadioButton + 自绘，选中走强调色 -->
+    <Style x:Key="Seg" TargetType="RadioButton">
+      <Setter Property="Foreground" Value="{DynamicResource TextSecondaryBrush}"/>
+      <Setter Property="Background" Value="Transparent"/>
+      <Setter Property="Cursor" Value="Hand"/>
+      <Setter Property="FocusVisualStyle" Value="{x:Null}"/>
+      <Setter Property="Margin" Value="3,0,0,0"/>
+      <Setter Property="Template">
+        <Setter.Value>
+          <ControlTemplate TargetType="RadioButton">
+            <Border x:Name="Bd" Background="{TemplateBinding Background}" CornerRadius="4"
+                    BorderBrush="{DynamicResource CardBorderBrush}" BorderThickness="1" Padding="9,3,9,4">
+              <ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center"/>
+            </Border>
+            <ControlTemplate.Triggers>
+              <Trigger Property="IsMouseOver" Value="True">
+                <Setter TargetName="Bd" Property="Background" Value="{DynamicResource OverlayHoverBrush}"/>
+              </Trigger>
+              <Trigger Property="IsChecked" Value="True">
+                <Setter TargetName="Bd" Property="Background" Value="{DynamicResource AccentBrush}"/>
+                <Setter TargetName="Bd" Property="BorderBrush" Value="Transparent"/>
+                <Setter Property="Foreground" Value="{DynamicResource OnAccentBrush}"/>
+              </Trigger>
+            </ControlTemplate.Triggers>
+          </ControlTemplate>
+        </Setter.Value>
+      </Setter>
+    </Style>
   </Window.Resources>
 
   <Grid Margin="12">
     <!-- 阴影层（不承载文字，避免 Effect 把整棵子树栅格化） -->
-    <Border CornerRadius="8" Background="#000000">
+    <Border x:Name="ShadowLayer" CornerRadius="8" Background="{DynamicResource ShadowBrush}">
       <Border.Effect>
         <DropShadowEffect BlurRadius="24" ShadowDepth="0" Opacity="0.5" Color="#000000"/>
       </Border.Effect>
     </Border>
 
-    <Border x:Name="RootCard" CornerRadius="8" BorderThickness="1" BorderBrush="#14FFFFFF">
-      <Border.Background>
-        <LinearGradientBrush StartPoint="0,0" EndPoint="0,1">
-          <GradientStop Color="#212121" Offset="0"/>
-          <GradientStop Color="#1E1E1E" Offset="1"/>
-        </LinearGradientBrush>
-      </Border.Background>
+    <Border x:Name="RootCard" CornerRadius="8" BorderThickness="1"
+            BorderBrush="{DynamicResource CardBorderBrush}" Background="{DynamicResource RootCardBrush}">
       <Grid>
         <Grid.RowDefinitions>
           <RowDefinition Height="40"/>
@@ -1181,7 +1661,7 @@ $xamlText = @'
           <Border x:Name="DragArea" Background="Transparent"/>
           <StackPanel Orientation="Horizontal" Margin="16,0,0,0" VerticalAlignment="Center" IsHitTestVisible="False">
             <Image x:Name="HeaderIcon" Width="16" Height="16"/>
-            <TextBlock Text="Basalt 启动器" FontSize="12" Foreground="#C8C8C8" Margin="9,0,0,0"
+            <TextBlock Text="Basalt 启动器" FontSize="12" Foreground="{DynamicResource TextSecondaryBrush}" Margin="9,0,0,0"
                        VerticalAlignment="Center"/>
           </StackPanel>
           <StackPanel Orientation="Horizontal" HorizontalAlignment="Right" VerticalAlignment="Top" Margin="0,5,5,0">
@@ -1203,17 +1683,18 @@ $xamlText = @'
             <RowDefinition Height="Auto"/>
             <RowDefinition Height="Auto"/>
             <RowDefinition Height="Auto"/>
+            <RowDefinition Height="Auto"/>
             <RowDefinition Height="*"/>
             <RowDefinition Height="Auto"/>
           </Grid.RowDefinitions>
 
           <TextBlock Text="本地 AI 推理服务" FontSize="20" FontWeight="SemiBold"
-                     FontFamily="Segoe UI Variable Display, Microsoft YaHei UI" Foreground="#FFFFFF"/>
-          <TextBlock x:Name="TxtSubtitle" Grid.Row="1" Text="—" FontSize="12" Foreground="#9A9A9A"
+                     FontFamily="Segoe UI Variable Display, Microsoft YaHei UI" Foreground="{DynamicResource TextPrimaryBrush}"/>
+          <TextBlock x:Name="TxtSubtitle" Grid.Row="1" Text="—" FontSize="12" Foreground="{DynamicResource TextTertiaryBrush}"
                      Margin="0,2,0,0"/>
 
           <!-- 状态卡 -->
-          <Border x:Name="StatusCard" Grid.Row="2" Background="#2B2B2B" BorderBrush="#14FFFFFF"
+          <Border x:Name="StatusCard" Grid.Row="2" Background="{DynamicResource CardBgBrush}" BorderBrush="{DynamicResource CardBorderBrush}"
                   BorderThickness="1" CornerRadius="6" Padding="16,12" Margin="0,16,0,0">
             <Grid>
               <Grid.RowDefinitions>
@@ -1228,25 +1709,25 @@ $xamlText = @'
                 <ColumnDefinition Width="Auto"/>
               </Grid.ColumnDefinitions>
               <TextBlock x:Name="StatusIcon" Grid.Row="0" Grid.Column="0" Text="&#xE7E8;"
-                         Style="{StaticResource Glyph}" FontSize="16" Foreground="#9A9A9A"
+                         Style="{StaticResource Glyph}" FontSize="16" Foreground="{DynamicResource TextTertiaryBrush}"
                          RenderTransformOrigin="0.5,0.5" VerticalAlignment="Center">
                 <TextBlock.RenderTransform>
                   <RotateTransform x:Name="StatusIconRotate" Angle="0"/>
                 </TextBlock.RenderTransform>
               </TextBlock>
               <TextBlock x:Name="TxtState" Grid.Row="0" Grid.Column="1" Text="正在检查…"
-                         FontSize="14" FontWeight="SemiBold" Foreground="#FFFFFF"
+                         FontSize="14" FontWeight="SemiBold" Foreground="{DynamicResource TextPrimaryBrush}"
                          Margin="10,0,0,0" VerticalAlignment="Center"/>
               <TextBlock x:Name="TxtUptime" Grid.Row="0" Grid.Column="2" Text=""
-                         FontSize="12" Foreground="#9A9A9A" VerticalAlignment="Center"/>
+                         FontSize="12" Foreground="{DynamicResource TextTertiaryBrush}" VerticalAlignment="Center"/>
               <TextBlock x:Name="TxtMeta" Grid.Row="1" Grid.Column="1" Grid.ColumnSpan="2" Text="—"
-                         FontSize="12" Foreground="#C8C8C8" Margin="10,4,0,0"
+                         FontSize="12" Foreground="{DynamicResource TextSecondaryBrush}" Margin="10,4,0,0"
                          TextTrimming="CharacterEllipsis"/>
               <TextBlock x:Name="TxtMetrics" Grid.Row="2" Grid.Column="1" Grid.ColumnSpan="2" Text=""
-                         FontSize="12" Foreground="#79C0FF" Margin="10,4,0,0"
+                         FontSize="12" Foreground="{DynamicResource AccentTextBrush}" Margin="10,4,0,0"
                          TextTrimming="CharacterEllipsis" Visibility="Collapsed"/>
               <TextBlock x:Name="TxtHint" Grid.Row="3" Grid.Column="1" Grid.ColumnSpan="2" Text="—"
-                         FontSize="12" Foreground="#9A9A9A" Margin="10,2,0,0" TextWrapping="Wrap"/>
+                         FontSize="12" Foreground="{DynamicResource TextTertiaryBrush}" Margin="10,2,0,0" TextWrapping="Wrap"/>
             </Grid>
           </Border>
 
@@ -1273,30 +1754,111 @@ $xamlText = @'
             </Button>
           </Grid>
 
-          <!-- 设置卡：开机自启动 -->
-          <Border x:Name="SettingsCard" Grid.Row="4" Background="#2B2B2B" BorderBrush="#14FFFFFF"
+          <!-- 设置卡：两条开机自启（服务 / 启动器托盘） -->
+          <Border x:Name="SettingsCard" Grid.Row="4" Background="{DynamicResource CardBgBrush}" BorderBrush="{DynamicResource CardBorderBrush}"
                   BorderThickness="1" CornerRadius="6" Padding="16,10" Margin="0,12,0,0">
             <Grid>
-              <StackPanel VerticalAlignment="Center">
+              <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="*"/>
+                <ColumnDefinition Width="Auto"/>
+              </Grid.ColumnDefinitions>
+              <Grid.RowDefinitions>
+                <RowDefinition Height="Auto"/>
+                <RowDefinition Height="Auto"/>
+                <RowDefinition Height="Auto"/>
+              </Grid.RowDefinitions>
+
+              <StackPanel Grid.Row="0" Grid.Column="0" VerticalAlignment="Center">
                 <StackPanel Orientation="Horizontal">
                   <TextBlock Text="&#xE7E8;" Style="{StaticResource Glyph}" FontSize="15"
-                             Foreground="#C8C8C8" Margin="0,0,10,0"/>
-                  <TextBlock Text="开机自启动" FontSize="14" Foreground="#FFFFFF" VerticalAlignment="Center"/>
-                  <Border x:Name="AutoBadge" Background="#14FFFFFF" CornerRadius="4" Padding="6,1,6,2"
+                             Foreground="{DynamicResource TextSecondaryBrush}" Margin="0,0,10,0"/>
+                  <TextBlock Text="服务开机自启动" FontSize="14" Foreground="{DynamicResource TextPrimaryBrush}" VerticalAlignment="Center"/>
+                  <Border x:Name="AutoBadge" Background="{DynamicResource BadgeOffBgBrush}" CornerRadius="4" Padding="6,1,6,2"
                           Margin="8,0,0,0" VerticalAlignment="Center">
-                    <TextBlock x:Name="TxtAutoState" Text="已关闭" FontSize="11" Foreground="#9A9A9A"/>
+                    <TextBlock x:Name="TxtAutoState" Text="已关闭" FontSize="11" Foreground="{DynamicResource TextTertiaryBrush}"/>
                   </Border>
                 </StackPanel>
                 <TextBlock Text="登录 Windows 后静默加载服务，无需手动启动" FontSize="12"
-                           Foreground="#9A9A9A" Margin="25,3,0,0"/>
+                           Foreground="{DynamicResource TextTertiaryBrush}" Margin="25,3,0,0"/>
               </StackPanel>
-              <ToggleButton x:Name="ToggleAuto" Style="{StaticResource Switch}"
-                            HorizontalAlignment="Right" VerticalAlignment="Center"/>
+              <ToggleButton x:Name="ToggleAuto" Grid.Row="0" Grid.Column="1" Style="{StaticResource Switch}"
+                            VerticalAlignment="Center"/>
+
+              <Border Grid.Row="1" Grid.ColumnSpan="2" Height="1" Background="{DynamicResource BadgeOffBgBrush}" Margin="0,9,0,9"/>
+
+              <StackPanel Grid.Row="2" Grid.Column="0" VerticalAlignment="Center">
+                <StackPanel Orientation="Horizontal">
+                  <TextBlock Text="&#xE7ED;" Style="{StaticResource Glyph}" FontSize="15"
+                             Foreground="{DynamicResource TextSecondaryBrush}" Margin="0,0,10,0"/>
+                  <TextBlock Text="启动器开机自启" FontSize="14" Foreground="{DynamicResource TextPrimaryBrush}" VerticalAlignment="Center"/>
+                  <Border x:Name="LauncherBadge" Background="{DynamicResource BadgeOffBgBrush}" CornerRadius="4" Padding="6,1,6,2"
+                          Margin="8,0,0,0" VerticalAlignment="Center">
+                    <TextBlock x:Name="TxtLauncherState" Text="已关闭" FontSize="11" Foreground="{DynamicResource TextTertiaryBrush}"/>
+                  </Border>
+                </StackPanel>
+                <TextBlock Text="登录后启动器收在右下角托盘（不弹窗、不加载模型）" FontSize="12"
+                           Foreground="{DynamicResource TextTertiaryBrush}" Margin="25,3,0,0"/>
+              </StackPanel>
+              <ToggleButton x:Name="ToggleLauncher" Grid.Row="2" Grid.Column="1" Style="{StaticResource Switch}"
+                            VerticalAlignment="Center"/>
+            </Grid>
+          </Border>
+
+          <!-- 外观卡：主题（深色/浅色/跟随系统）+ 背景材质 -->
+          <Border x:Name="AppearanceCard" Grid.Row="5" Background="{DynamicResource CardBgBrush}"
+                  BorderBrush="{DynamicResource CardBorderBrush}"
+                  BorderThickness="1" CornerRadius="6" Padding="16,10" Margin="0,12,0,0">
+            <Grid>
+              <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="*"/>
+                <ColumnDefinition Width="Auto"/>
+              </Grid.ColumnDefinitions>
+              <Grid.RowDefinitions>
+                <RowDefinition Height="Auto"/>
+                <RowDefinition Height="Auto"/>
+                <RowDefinition Height="Auto"/>
+              </Grid.RowDefinitions>
+
+              <StackPanel Grid.Row="0" Grid.Column="0" VerticalAlignment="Center">
+                <TextBlock Text="主题" FontSize="14" Foreground="{DynamicResource TextPrimaryBrush}" VerticalAlignment="Center"/>
+                <TextBlock Text="深色 / 浅色，或实时跟随 Windows" FontSize="12"
+                           Foreground="{DynamicResource TextTertiaryBrush}" TextTrimming="CharacterEllipsis" Margin="0,3,0,0"/>
+              </StackPanel>
+              <StackPanel Grid.Row="0" Grid.Column="1" Orientation="Horizontal" VerticalAlignment="Center">
+                <RadioButton x:Name="SegThemeDark" Style="{StaticResource Seg}" GroupName="Theme">
+                  <TextBlock Text="深色" FontSize="12"/>
+                </RadioButton>
+                <RadioButton x:Name="SegThemeLight" Style="{StaticResource Seg}" GroupName="Theme">
+                  <TextBlock Text="浅色" FontSize="12"/>
+                </RadioButton>
+                <RadioButton x:Name="SegThemeSystem" Style="{StaticResource Seg}" GroupName="Theme">
+                  <TextBlock Text="跟随系统" FontSize="12"/>
+                </RadioButton>
+              </StackPanel>
+
+              <Border Grid.Row="1" Grid.ColumnSpan="2" Height="1" Background="{DynamicResource CardBorderBrush}" Margin="0,9,0,9"/>
+
+              <StackPanel Grid.Row="2" Grid.Column="0" VerticalAlignment="Center">
+                <TextBlock Text="背景材质" FontSize="14" Foreground="{DynamicResource TextPrimaryBrush}" VerticalAlignment="Center"/>
+                <TextBlock x:Name="MatHint" Text="实色卡片，最省电" FontSize="12"
+                           Foreground="{DynamicResource TextTertiaryBrush}" TextTrimming="CharacterEllipsis" Margin="0,3,0,0"/>
+              </StackPanel>
+              <StackPanel Grid.Row="2" Grid.Column="1" Orientation="Horizontal" VerticalAlignment="Center">
+                <RadioButton x:Name="SegMatOpaque" Style="{StaticResource Seg}" GroupName="Material">
+                  <TextBlock Text="实色" FontSize="12"/>
+                </RadioButton>
+                <RadioButton x:Name="SegMatTranslucent" Style="{StaticResource Seg}" GroupName="Material">
+                  <TextBlock Text="半透明" FontSize="12"/>
+                </RadioButton>
+                <RadioButton x:Name="SegMatWallpaper" Style="{StaticResource Seg}" GroupName="Material">
+                  <TextBlock Text="壁纸取色" FontSize="12"/>
+                </RadioButton>
+              </StackPanel>
             </Grid>
           </Border>
 
           <!-- 次要操作 -->
-          <StackPanel Grid.Row="5" Orientation="Horizontal" Margin="-10,10,0,0">
+          <StackPanel Grid.Row="6" Orientation="Horizontal" Margin="-10,10,0,0">
             <Button x:Name="BtnOpen" Style="{StaticResource LinkButton}">
               <StackPanel Orientation="Horizontal">
                 <TextBlock Text="&#xE774;" Style="{StaticResource Glyph}" FontSize="13" Margin="0,0,7,0"/>
@@ -1324,12 +1886,18 @@ $xamlText = @'
             </Button>
           </StackPanel>
 
-          <!-- 页脚 -->
-          <Grid Grid.Row="7" Margin="0,8,0,0">
-            <TextBlock x:Name="TxtCloseHint" Text="关闭窗口不会停止服务" FontSize="11" Foreground="#7A7A7A"
+          <!-- 页脚：左边关闭提示、右边版本号，分两列，别再叠在一起 -->
+          <Grid Grid.Row="8" Margin="0,8,0,0">
+            <Grid.ColumnDefinitions>
+              <ColumnDefinition Width="*"/>
+              <ColumnDefinition Width="Auto"/>
+            </Grid.ColumnDefinitions>
+            <TextBlock x:Name="TxtCloseHint" Text="关闭窗口不会停止服务" FontSize="11"
+                       Foreground="{DynamicResource TextMutedBrush}" TextTrimming="CharacterEllipsis"
                        VerticalAlignment="Center"/>
-            <TextBlock x:Name="TxtFooter" Text="Basalt · Launcher 1.0" FontSize="11"
-                       Foreground="#7A7A7A" HorizontalAlignment="Right" VerticalAlignment="Center"/>
+            <TextBlock x:Name="TxtFooter" Grid.Column="1" Text="Basalt · Launcher 1.0" FontSize="11"
+                       Foreground="{DynamicResource TextMutedBrush}" Margin="14,0,0,0"
+                       HorizontalAlignment="Right" VerticalAlignment="Center"/>
           </Grid>
         </Grid>
       </Grid>
@@ -1344,6 +1912,9 @@ $ui = @{}
 foreach ($name in @('RootCard', 'StatusCard', 'StatusIcon', 'StatusIconRotate', 'TxtState', 'TxtUptime',
                     'TxtMeta', 'TxtMetrics', 'TxtHint', 'TxtSubtitle', 'BtnStart', 'BtnStop', 'BtnOpen', 'BtnLog',
                     'BtnPanel', 'BtnCfg', 'ToggleAuto', 'TxtAutoState', 'AutoBadge', 'SettingsCard',
+                    'ToggleLauncher', 'TxtLauncherState', 'LauncherBadge',
+                    'SegThemeDark', 'SegThemeLight', 'SegThemeSystem',
+                    'SegMatOpaque', 'SegMatTranslucent', 'SegMatWallpaper', 'MatHint', 'ShadowLayer',
                     'BtnMin', 'BtnClose', 'DragArea', 'HeaderIcon', 'TxtFooter', 'TxtCloseHint')) {
     $ui[$name] = $script:Window.FindName($name)
 }
@@ -1374,11 +1945,31 @@ $luminance = (0.299 * $script:AccentColor.R + 0.587 * $script:AccentColor.G + 0.
 $script:OnAccentColor = if ($luminance -gt 0.6) { $black } else { $white }
 
 $res = $script:Window.Resources
+$script:Resources = $res
 $res['AccentBrush']        = [System.Windows.Media.SolidColorBrush]::new($script:AccentColor)
 $res['AccentHoverBrush']   = [System.Windows.Media.SolidColorBrush]::new((Mix-Color $script:AccentColor $white 0.14))
 $res['AccentPressedBrush'] = [System.Windows.Media.SolidColorBrush]::new((Mix-Color $script:AccentColor $black 0.18))
 $res['OnAccentBrush']      = [System.Windows.Media.SolidColorBrush]::new($script:OnAccentColor)
 $script:AccentBrush = $res['AccentBrush']
+
+# ------------------------------------------------------------ 外观：主题/材质 --
+# 先把分段控件按偏好摆好，再挂事件：初始化时不会反过来触发自己的 handler
+if ($ui.SegThemeDark) {
+    $ui.SegThemeDark.IsChecked      = ($script:ThemeChoice -eq 'dark')
+    $ui.SegThemeLight.IsChecked     = ($script:ThemeChoice -eq 'light')
+    $ui.SegThemeSystem.IsChecked    = ($script:ThemeChoice -eq 'system')
+    $ui.SegMatOpaque.IsChecked      = ($script:MaterialChoice -eq 'opaque')
+    $ui.SegMatTranslucent.IsChecked = ($script:MaterialChoice -eq 'translucent')
+    $ui.SegMatWallpaper.IsChecked   = ($script:MaterialChoice -eq 'wallpaper')
+    $ui.SegThemeDark.Add_Checked({ Set-ThemeChoice 'dark' })
+    $ui.SegThemeLight.Add_Checked({ Set-ThemeChoice 'light' })
+    $ui.SegThemeSystem.Add_Checked({ Set-ThemeChoice 'system' })
+    $ui.SegMatOpaque.Add_Checked({ Set-MaterialChoice 'opaque' })
+    $ui.SegMatTranslucent.Add_Checked({ Set-MaterialChoice 'translucent' })
+    $ui.SegMatWallpaper.Add_Checked({ Set-MaterialChoice 'wallpaper' })
+}
+[void](Apply-Theme -Force)
+Update-MaterialHint
 $ui.TxtSubtitle.Text = "Basalt 引擎 · 模型 $($script:ModelName) · OpenAI 兼容接口"
 
 # 图标：WPF 直接解码 ICO 会默认选 16×16，再把它居中塞进任务栏的大图标里。
@@ -1428,9 +2019,9 @@ function Set-ToolTipStyle {
     $text = $Element.ToolTip
     $tip = New-Object System.Windows.Controls.ToolTip
     $tip.Content = $text
-    $tip.Background = Get-Brush '#323232'
-    $tip.Foreground = Get-Brush '#FFFFFF'
-    $tip.BorderBrush = Get-Brush '#26FFFFFF'
+    $tip.Background  = Get-ThemeBrush 'TipBg'
+    $tip.Foreground  = Get-ThemeBrush 'TipFg'
+    $tip.BorderBrush = Get-ThemeBrush 'TipBorder'
     $tip.Padding = New-Object System.Windows.Thickness(9, 4, 9, 5)
     $tip.FontSize = 12
     $tip.HasDropShadow = $false
@@ -1448,8 +2039,11 @@ function Set-ToolTipStyle {
         $tip.Template = $tpl
     } catch { }
     $Element.ToolTip = $tip
+    # 主题切换时要把已经建好的 ToolTip 一起改色（它们不在窗口资源树里）
+    if (-not $script:TipElements) { $script:TipElements = @() }
+    $script:TipElements += $tip
 }
-foreach ($key in @('BtnStart', 'BtnStop', 'BtnOpen', 'BtnLog', 'BtnCfg', 'BtnMin', 'BtnClose', 'ToggleAuto')) {
+foreach ($key in @('BtnStart', 'BtnStop', 'BtnOpen', 'BtnLog', 'BtnCfg', 'BtnMin', 'BtnClose', 'ToggleAuto', 'ToggleLauncher')) {
     Set-ToolTipStyle $ui[$key]
 }
 
@@ -1461,7 +2055,7 @@ try {
         $engineVersion = [string](Get-Item -LiteralPath $exePath).VersionInfo.FileVersion
     }
     if (-not $engineVersion) { $engineVersion = '0.4.1' }
-    $ui.TxtFooter.Text = "Basalt $engineVersion  ·  Launcher 1.3"
+    $ui.TxtFooter.Text = "Basalt $engineVersion  ·  Launcher 1.5"
 } catch { }
 
 # ------------------------------------------------------------ 系统托盘 --
@@ -1618,10 +2212,10 @@ function Update-TrayIconColor {
 }
 
 function New-TrayMenuItem {
-    param([string]$Text, $OnClick, [bool]$Checkable = $false)
+    param([string]$Text, $OnClick, [bool]$Checkable = $false, [bool]$Checked = $false)
     $item = New-Object System.Windows.Forms.ToolStripMenuItem
     $item.Text = $Text
-    if ($Checkable) { $item.Checked = [bool]$script:CloseToTray }
+    if ($Checkable) { $item.Checked = $Checked }
     if ($OnClick) { $item.Add_Click($OnClick) }
     return $item
 }
@@ -1639,11 +2233,14 @@ function New-TrayIcon {
         $script:MenuStop = New-TrayMenuItem '停止服务' { Invoke-TrayAction 'stop' }
         $script:MenuOpen = New-TrayMenuItem '打开网页' { Open-Endpoint }
         $script:MenuPanel = New-TrayMenuItem '显示 / 隐藏监控面板' { Toggle-MonitorPanel }
+        $script:MenuLauncherAuto = New-TrayMenuItem '登录时启动（藏在托盘）' `
+            { Set-LauncherAutostart (-not (Get-LauncherAutostartInfo).On) } $true (Get-LauncherAutostartInfo).On
         $script:MenuTrayPref = New-TrayMenuItem '关闭时收进托盘' `
-            { Set-CloseToTray (-not $script:CloseToTray) } $true
+            { Set-CloseToTray (-not $script:CloseToTray) } $true $script:CloseToTray
         foreach ($item in @($script:MenuShow, (New-Object System.Windows.Forms.ToolStripSeparator),
                              $script:MenuStart, $script:MenuStop, $script:MenuOpen, $script:MenuPanel,
-                             (New-Object System.Windows.Forms.ToolStripSeparator), $script:MenuTrayPref,
+                             (New-Object System.Windows.Forms.ToolStripSeparator), $script:MenuLauncherAuto,
+                             $script:MenuTrayPref,
                              (New-Object System.Windows.Forms.ToolStripSeparator),
                              (New-TrayMenuItem '退出' { Exit-Launcher }))) {
             [void]$menu.Items.Add($item)
@@ -1789,13 +2386,14 @@ function Set-CloseToTray {
 }
 
 function Hide-ToTray {
+    param([switch]$Quiet)
     if ($script:Hidden) { return }
     if (-not $script:Tray) { New-TrayIcon }
     if (-not $script:Tray) { return }          # 托盘建不起来就别把窗口藏没了
     $script:Window.Hide()
     $script:Hidden = $true
     Write-Log 'launcher hidden to tray'
-    if (-not $script:TrayHintShown) {
+    if (-not $Quiet -and -not $script:TrayHintShown) {
         $script:TrayHintShown = $true
         Show-Balloon 'Basalt 启动器已收进托盘' `
             ('点 ✕ 不再退出程序：服务继续跑，启动器待在右下角托盘里。' + "`n" +
@@ -1813,6 +2411,10 @@ function Show-FromTray {
         return
     }
     try {
+        # -StartInTray 启动时 Opacity 被压到 0（见文件末尾），叫回来必须还原，不然窗口是透明的
+        try { $script:Window.BeginAnimation([System.Windows.Window]::OpacityProperty, $null) } catch { }
+        $script:Window.Opacity = 1.0
+        $script:Window.ShowInTaskbar = $true
         $script:Window.Show()
         $script:Window.WindowState = [System.Windows.WindowState]::Normal
         $script:Window.Topmost = $true
@@ -1897,6 +2499,14 @@ $ui.ToggleAuto.Add_Unchecked({
     if ($script:SuppressToggle) { return }
     Set-Autostart $false
 })
+$ui.ToggleLauncher.Add_Checked({
+    if ($script:SuppressLauncherToggle) { return }
+    Set-LauncherAutostart $true
+})
+$ui.ToggleLauncher.Add_Unchecked({
+    if ($script:SuppressLauncherToggle) { return }
+    Set-LauncherAutostart $false
+})
 $script:Window.Add_KeyDown({
     param($sender, $e)
     if ($e.Key -eq [System.Windows.Input.Key]::Escape) { $script:Window.Close() }
@@ -1908,22 +2518,44 @@ $script:Timer.Add_Tick({ try { Update-Ui } catch { Write-Log "ui tick failed: $(
 
 $script:Window.Add_Loaded({
     Write-Log "launcher opened (root=$($script:Root))"
-    $anim = New-Object System.Windows.Media.Animation.DoubleAnimation
-    $anim.From = 0.0
-    $anim.To = 1.0
-    $anim.Duration = [System.Windows.Duration]::new([TimeSpan]::FromMilliseconds(160))
-    $script:Window.BeginAnimation([System.Windows.Window]::OpacityProperty, $anim)
-    # 隐藏控制台启动时窗口可能落在其它窗口后面：Topmost 闪一下带回前台
-    try {
-        $script:Window.Topmost = $true
-        $script:Window.Topmost = $false
-        $script:Window.Activate() | Out-Null
-    } catch { }
     Set-NativeWindowIcons
     # 托盘：先探一下能不能用（用不了就退回「关窗口即退出」），再把 ✕ 和页脚的文案对齐
     if ($script:CloseToTray -and -not (Test-TrayAvailable)) {
         $script:CloseToTray = $false
         Show-Toast '系统托盘不可用，窗口仍按原样关闭退出' 'warn'
+    }
+    # -StartInTray（登录自启）：窗口一帧都不露面，进 Loaded 就直接收进托盘
+    $hiddenAtBoot = $false
+    if ($script:StartInTray) {
+        $script:StartInTray = $false      # 只管这一次启动，之后 ✕ / 托盘菜单回到常规
+        Hide-ToTray -Quiet
+        $hiddenAtBoot = [bool]$script:Hidden
+        if (-not $hiddenAtBoot) {
+            $script:Window.ShowInTaskbar = $true      # 退回普通窗口就得回任务栏
+            Show-Toast '系统托盘没建起来，已按普通方式打开窗口' 'warn'
+        }
+    }
+    if ($hiddenAtBoot) {
+        Write-Log 'launcher started hidden to tray (-StartInTray)'
+        if (-not $script:StartTrayHintShown) {
+            $script:StartTrayHintShown = $true
+            Save-LauncherSettings
+            Show-Balloon 'Basalt 启动器已随登录启动' `
+                ('窗口收在右下角托盘里：双击 = 叫回启动器窗口，单击 = 监控面板，右键 = 菜单。' + "`n" +
+                 '启动器只挂图标；模型是另一条「服务开机自启动」在加载。这句提示只弹一次。') 8
+        }
+    } else {
+        $anim = New-Object System.Windows.Media.Animation.DoubleAnimation
+        $anim.From = 0.0
+        $anim.To = 1.0
+        $anim.Duration = [System.Windows.Duration]::new([TimeSpan]::FromMilliseconds(160))
+        $script:Window.BeginAnimation([System.Windows.Window]::OpacityProperty, $anim)
+        # 隐藏控制台启动时窗口可能落在其它窗口后面：Topmost 闪一下带回前台
+        try {
+            $script:Window.Topmost = $true
+            $script:Window.Topmost = $false
+            $script:Window.Activate() | Out-Null
+        } catch { }
     }
     Update-CloseHint
     Add-SessionEndHook
@@ -1949,6 +2581,13 @@ $script:Window.Add_Closed({
 try {
     # 这里不能用 ShowDialog：对话框模式下一 Hide() 就会返回、脚本走到末尾进程就退了
     # （托盘收起也就没了）。改成 Show + 自己跑消息泵，真退出时在 Closed 里停机。
+    if ($script:StartInTray) {
+        # 登录自启：先压成全透明再 Show。AllowsTransparency=True + Opacity=0 = 这一帧什么都不画，
+        # 窗口只是走个过场让 Loaded 跑起来；Loaded 里立刻收进托盘（见 Add_Loaded）。
+        $script:Window.ShowActivated = $false
+        $script:Window.ShowInTaskbar = $false   # 免得透明走过场那一下在任务栏闪个按钮
+        $script:Window.Opacity = 0.0
+    }
     $script:Window.Show()
     [System.Windows.Threading.Dispatcher]::Run()   # 静态方法：跑本线程（UI 线程）的消息泵
 } finally {

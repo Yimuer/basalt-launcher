@@ -1,0 +1,30 @@
+' Basalt launcher bootstrap: runs launcher.ps1 with no console window.
+' Double-click launcher.cmd (or the "Basalt launcher" shortcut) to run this file.
+' Extra arguments are forwarded to launcher.ps1, e.g.
+'   wscript.exe "...\launch.vbs" -StartInTray   <- used by HKCU Run "BasaltLauncher"
+' If the launcher crashes on startup, run launcher-debug.cmd instead.
+Option Explicit
+
+Dim fso, sh, here, ps, script, args, i
+
+Set fso = CreateObject("Scripting.FileSystemObject")
+Set sh = CreateObject("WScript.Shell")
+
+here = fso.GetParentFolderName(WScript.ScriptFullName)
+script = fso.BuildPath(here, "launcher.ps1")
+ps = sh.ExpandEnvironmentStrings("%SystemRoot%") & "\System32\WindowsPowerShell\v1.0\powershell.exe"
+
+args = ""
+For i = 0 To WScript.Arguments.Count - 1
+    args = args & " " & QuoteArg(WScript.Arguments(i))
+Next
+
+sh.Run """" & ps & """ -NoProfile -STA -ExecutionPolicy Bypass -WindowStyle Hidden -File """ & script & """" & args, 0, False
+
+Function QuoteArg(s)
+    If InStr(s, " ") > 0 Or InStr(s, vbTab) > 0 Or Len(s) = 0 Then
+        QuoteArg = """" & s & """"
+    Else
+        QuoteArg = s
+    End If
+End Function
