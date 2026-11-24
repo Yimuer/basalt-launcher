@@ -12,8 +12,12 @@ A WinUI 3 / Fluent-style control panel for a [Basalt](https://github.com/yanmind
 - **状态卡**：每 1.2 秒轮询 `/health` + `logs\serve.pid`，显示 运行中 / 正在加载模型 / 正在启动 / 正在停止 / 启动失败 / 已停止，以及 PID、运行时长、模型名、端口、上下文
 - **开机自启动**：写 / 删 `HKCU\Software\Microsoft\Windows\CurrentVersion\Run\BasaltLocalAI`，与 `bin\autostart.cmd` 是同一项；登录 Windows 后由 `bin\boot.vbs` 静默拉起服务
 - **快捷入口**：打开网页（`http://127.0.0.1:8080`）、引擎日志、`bin\config.cmd`
-- **不打断服务**：关闭窗口不会停止服务
-- **单实例**：重复双击只会把已打开的窗口叫到前台
+- **不打断服务**：点 ✕ 不会停止服务，而是把启动器收进系统托盘（可以在托盘菜单里关掉这个行为）
+- **系统托盘**：收起后右下角留一个图标，悬停显示服务状态；**单击** = 叫出右下角的监控面板并提到最前，**双击** = 叫回主窗口，右键菜单 = 显示主窗口 / 启动服务 / 停止服务 / 打开网页 / 显示·隐藏监控面板 / 关闭时收进托盘（勾选项）/ 退出。只有「退出」才会真的关掉启动器
+- **单实例**：重复双击只会把窗口叫到前台——窗口收在托盘里时也一样，第二个实例会自己退出并让第一个把窗口显示出来
+- **监控读数**：状态卡多一行 空闲/生成中、tok/s、GPU%、温度、显存（`GET /metrics`，约 3.6 秒一次）；同一份数据进托盘悬停文字，托盘图标按状态上色（空闲=系统强调色 / 生成=绿 / 加载=黄 / 告警=红 / 停止=灰）
+- **收放监控面板**：界面和托盘菜单里的「监控面板」显示 / 隐藏 `tray\tray.py` 那块桌面面板——它现在以 `--no-tray` 跑，不再挂第二个托盘图标；**单击托盘图标**只"叫出并提到最前"（已显示也不会藏起来，因为面板默认不总在最前、容易被别的窗口盖住）；面板自己的右键菜单里有「Basalt 启动器窗口」反向叫回这里
+- **系统通知身份**：托盘提示走 Windows 通知中心，抬头是「Basalt 启动器」+ 自己的图标（进程 AUMID + 启动时在 `HKCU\...\AppUserModelId` 注册 `DisplayName` / `IconUri`）
 - **Fluent 细节**：系统强调色、Fluent 开关 / 按钮 / 深色 ToolTip、加载时旋转的状态图标、自绘 40 px 标题栏与窗口按钮
 
 ## 界面
@@ -29,7 +33,7 @@ Windows 11 深色 Fluent：`#202020` 近 Mica 底色、`#2B2B2B` 卡片、4/6/8 
   - `stop.cmd`
   - `bin\config.cmd`（提供 `HOST` / `PORT` / `MODEL_NAME` / `MAX_CONTEXT` / `PIDFILE` / `LOG`）
   - 引擎的 `/health` 接口（就绪返回 200）
-- 不需要 Python / Node / 任何第三方包
+- 启动器本身不需要 Python / Node / 任何第三方包（「监控面板」只是负责显示 / 拉起 `tray\tray.py`，那个进程才需要 Python）
 
 ## 安装
 
@@ -71,11 +75,12 @@ powershell -NoProfile -STA -ExecutionPolicy Bypass -File .\launcher.ps1 -Root "D
 
 ## 配置
 
-界面本身没有配置项，服务参数都在 Basalt 的 `bin\config.cmd` 里（`MAX_CONTEXT` / `PARALLEL` / `KV` / `RAM_RESERVE` / `EXTRA_FLAGS`）。改完在启动器里「停止服务」再「启动服务」即可。启动器运行日志在 `<basalt-root>\logs\launcher.log`。
+界面本身只有一个偏好：托盘菜单里的「关闭时收进托盘」，存在 `%LOCALAPPDATA%\BasaltLauncher\settings.json`（放这儿是因为 Basalt 常装在 `Program Files`，普通权限写不进去）。服务参数都在 Basalt 的 `bin\config.cmd` 里（`MAX_CONTEXT` / `PARALLEL` / `KV` / `RAM_RESERVE` / `EXTRA_FLAGS`）。改完在启动器里「停止服务」再「启动服务」即可。启动器运行日志在 `<basalt-root>\logs\launcher.log`。
 
 ## 排错
 
-- 窗口没出来：运行 `launcher-debug.cmd` 看报错；或看 `logs\launcher.log`
+- 窗口没出来：先确认没收进托盘（点任务栏上的「显示隐藏的图标」箭头，找「Basalt 启动器」）；再运行 `launcher-debug.cmd` 看报错，或看 `logs\launcher.log`
+- 想常驻在任务栏上：Win11 默认把新托盘图标收进「显示隐藏的图标」折叠区，把图标从折叠区拖到任务栏即可常驻（或 设置 → 个性化 → 任务栏 → 其他通知区域图标）
 - 一直停在「正在加载模型」：先看 Basalt 的 `status.cmd`、`logs\serve.log`，再看引擎日志 `C:\Users\<用户名>\.cache\basalt\<hash>\engine.log`
 - 启动失败代码：`1` = 引擎 / 模型包 / Python 缺失，`2` = 15 分钟仍未就绪，`3` = 引擎立即退出
 - 更换模型：改 `bin\config.cmd` 的 `MODEL` / `MODEL_NAME` 后，在启动器里停止再启动
@@ -95,7 +100,7 @@ powershell -NoProfile -STA -ExecutionPolicy Bypass -File .\launcher.ps1 -Root "D
 
 ## English
 
-Basalt Launcher is a single-folder Windows PowerShell 5.1 + WPF app that puts a WinUI 3 / Fluent-style face on a [Basalt](https://github.com/yanmindi/basalt-arm-sm121) local inference server. It starts and stops the server through the project's own `start.cmd silent` / `stop.cmd`, polls `/health` plus `logs\serve.pid` once a second, shows PID / uptime / model / endpoint / context, toggles logon autostart via `HKCU\...\Run\BasaltLocalAI`, and opens the web UI, engine log or config file. Closing the window never stops the server; a named mutex keeps it single-instance. The accent colour follows the Windows system accent, and the UI degrades gracefully on Windows 10. Copy the folder into your Basalt root as `launcher\`, run `install-shortcuts.ps1`, then launch it from the desktop. GPL-3.0.
+Basalt Launcher is a single-folder Windows PowerShell 5.1 + WPF app that puts a WinUI 3 / Fluent-style face on a [Basalt](https://github.com/yanmindi/basalt-arm-sm121) local inference server. It starts and stops the server through the project's own `start.cmd silent` / `stop.cmd`, polls `/health` plus `logs\serve.pid` once a second, shows PID / uptime / model / endpoint / context, toggles logon autostart via `HKCU\...\Run\BasaltLocalAI`, and opens the web UI, engine log or config file. Closing the window never stops the server — by default it hides the launcher into the system tray, where a left-click or double-click brings the window back and the right-click menu offers Show window / Start service / Stop service / Open web UI / a "hide to tray on close" toggle / Quit (only Quit really exits). A named mutex keeps it single-instance, so launching it again while hidden just asks the running copy to show itself. It also polls `/metrics` so the status card and the tray tooltip show decode speed, GPU utilisation, temperature and VRAM, tints its tray icon with the current state (idle = system accent, generating = green, loading = amber, warning = red, stopped = grey), and shows or hides the desktop monitor panel drawn by `tray\tray.py` — that process runs with `--no-tray` now, so there is only ever one Basalt tray icon. Once the launcher is collapsed to the tray, a **single click** on that icon brings the monitor panel forward (raising it above whatever was covering it) and a **double click** restores the main window. Tray notifications carry their own identity: the launcher registers its `AppUserModelID` (`DisplayName` + `IconUri`) under `HKCU` on startup, so Windows labels them "Basalt Launcher" with the launcher's icon instead of "Windows PowerShell". The accent colour follows the Windows system accent, and the UI degrades gracefully on Windows 10. Copy the folder into your Basalt root as `launcher\`, run `install-shortcuts.ps1`, then launch it from the desktop. GPL-3.0.
 
 ---
 
